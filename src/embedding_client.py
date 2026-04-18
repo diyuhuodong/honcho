@@ -4,6 +4,7 @@ import threading
 from collections import defaultdict
 from typing import NamedTuple
 
+import httpx
 import tiktoken
 from google import genai
 from openai import AsyncOpenAI
@@ -52,9 +53,15 @@ class _EmbeddingClient:
                 or "https://openrouter.ai/api/v1"
             )
             self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-            self.model = "openai/text-embedding-3-small"
+            self.model = settings.LLM.EMBEDDING_MODEL or "openai/text-embedding-3-small"
             self.max_embedding_tokens = settings.MAX_EMBEDDING_TOKENS
-            self.max_batch_size = 2048  # Same as OpenAI
+            self.max_batch_size = 2048
+        elif self.provider == "ollama":
+            base_url = settings.LLM.EMBEDDING_BASE_URL or "http://localhost:11434"
+            self.client = AsyncOpenAI(api_key="ollama", base_url=base_url)
+            self.model = settings.LLM.EMBEDDING_MODEL or "nomic-embed-text"
+            self.max_embedding_tokens = settings.MAX_EMBEDDING_TOKENS
+            self.max_batch_size = 100
         else:  # openai
             if api_key is None:
                 api_key = settings.LLM.OPENAI_API_KEY
@@ -78,6 +85,22 @@ class _EmbeddingClient:
                 f"Query exceeds maximum token limit of {self.max_embedding_tokens} tokens (got {token_count} tokens)"
             )
 
+        if self.provider == "ollama":
+            base_url = settings.LLM.EMBEDDING_BASE_URL or "http://localhost:11434"
+            dimensions = settings.VECTOR_STORE.DIMENSIONS
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{base_url}/api/embed",
+                    json={
+                        "model": self.model,
+                        "prompt": query,
+                        "dimensions": dimensions,
+                    },
+                    timeout=60.0,
+                )
+                response.raise_for_status()
+                return response.json()["embeddings"][0]
+
         if isinstance(self.client, genai.Client):
             response = await self.client.aio.models.embed_content(
                 model=self.model,
@@ -87,7 +110,7 @@ class _EmbeddingClient:
             if not response.embeddings or not response.embeddings[0].values:
                 raise ValueError("No embedding returned from Gemini API")
             return response.embeddings[0].values
-        else:  # openai
+        else:  # openai / openrouter
             response = await self.client.embeddings.create(
                 model=self.model, input=query
             )
@@ -122,7 +145,25 @@ class _EmbeddingClient:
                         for emb in response.embeddings:
                             if emb.values:
                                 embeddings.append(emb.values)
-                else:  # openai
+                elif self.provider == "ollama":
+                    base_url = (
+                        settings.LLM.EMBEDDING_BASE_URL or "http://localhost:11434"
+                    )
+                    dimensions = settings.VECTOR_STORE.DIMENSIONS
+                    async with httpx.AsyncClient() as client:
+                        response = await client.post(
+                            f"{base_url}/api/embed",
+                            json={
+                                "model": self.model,
+                                "input": batch,
+                                "dimensions": dimensions,
+                            },
+                            timeout=60.0,
+                        )
+                        response.raise_for_status()
+                        for emb in response.json()["embeddings"]:
+                            embeddings.append(emb)
+                else:  # openai / openrouter
                     response = await self.client.embeddings.create(
                         input=batch,
                         model=self.model,
