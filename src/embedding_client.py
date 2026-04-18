@@ -93,7 +93,7 @@ class _EmbeddingClient:
                     f"{base_url}/api/embed",
                     json={
                         "model": self.model,
-                        "prompt": query,
+                        "input": query,
                         "dimensions": dimensions,
                     },
                     timeout=60.0,

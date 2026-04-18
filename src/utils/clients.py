@@ -1898,6 +1898,10 @@ async def honcho_llm_call_inner(
             if json_mode and provider != "vllm":
                 openai_params["response_format"] = {"type": "json_object"}
 
+            # MiniMax/OpenAI-compatible providers need reasoning_split to separate thinking tokens
+            if provider == "custom" and not response_model:
+                openai_params["extra_body"] = {"reasoning_split": True}
+
             # custom shim for vLLM response model formatting
             # NOTE: this is all specific to the Representation model.
             # Do not call with any other response model.
@@ -1988,52 +1992,95 @@ async def honcho_llm_call_inner(
                     thinking_content=extract_openai_reasoning_content(vllm_response),
                 )
             elif response_model:
-                openai_params["response_format"] = response_model
-                response: ChatCompletion = await client.chat.completions.parse(  # pyright: ignore
-                    **openai_params
-                )
-                # Extract the parsed object for structured output
-                parsed_content = response.choices[0].message.parsed
-                if parsed_content is None:
-                    raise ValueError("No parsed content in structured response")
+                if provider == "custom":
+                    openai_params["response_format"] = {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": response_model.__name__,
+                            "schema": response_model.model_json_schema(),
+                        },
+                    }
+                    response: ChatCompletion = await client.chat.completions.create(**openai_params)
+                    raw_content = response.choices[0].message.content or ""
+                    finish_reason = response.choices[0].finish_reason
+                    usage = response.usage
 
-                usage = response.usage
-                finish_reason = response.choices[0].finish_reason
-
-                # Validate that parsed content matches the response model
-                if not isinstance(parsed_content, response_model):
-                    raise ValueError(
-                        f"Parsed content does not match the response model: {parsed_content} != {response_model}"
+                    logger.info(
+                        f"Custom provider response: content_length={len(raw_content) if raw_content else 0}, "
+                        f"finish_reason={finish_reason}, usage={usage}"
                     )
 
-                # Extract tool calls if present (though unlikely with structured output)
-                parsed_tool_calls: list[dict[str, Any]] = []
-                if (
-                    hasattr(response.choices[0].message, "tool_calls")
-                    and response.choices[0].message.tool_calls
-                ):
-                    for tool_call in response.choices[0].message.tool_calls:
-                        parsed_tool_calls.append(
-                            {
-                                "id": tool_call.id,
-                                "name": tool_call.function.name,
-                                "input": json.loads(tool_call.function.arguments)
-                                if tool_call.function.arguments
-                                else {},
-                            }
+                    if not raw_content:
+                        logger.warning(f"Empty content from custom provider {model}")
+                        parsed_content = response_model.model_validate_json('{"explicit": []}')
+                    else:
+                        import re
+                        json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_content, re.DOTALL)
+                        if json_match:
+                            json_str = json_match.group(1)
+                        else:
+                            json_str = raw_content
+                        try:
+                            repaired_json = validate_and_repair_json(json_str)
+                            parsed_content = response_model.model_validate_json(repaired_json)
+                        except (ValidationError, ValueError) as e:
+                            logger.error(f"Failed to parse structured response: {e}")
+                            logger.info(f"Raw content was: {raw_content[:500]}")
+                            parsed_content = response_model.model_validate_json('{"explicit": []}')
+
+                    cache_creation, cache_read = extract_openai_cache_tokens(usage)
+                    return HonchoLLMCallResponse(
+                        content=parsed_content,
+                        input_tokens=usage.prompt_tokens if usage else 0,
+                        output_tokens=usage.completion_tokens if usage else 0,
+                        cache_creation_input_tokens=cache_creation,
+                        cache_read_input_tokens=cache_read,
+                        finish_reasons=[finish_reason] if finish_reason else [],
+                        tool_calls_made=[],
+                        thinking_content=extract_openai_reasoning_content(response),
+                    )
+                else:
+                    openai_params["response_format"] = response_model
+                    response: ChatCompletion = await client.chat.completions.parse(**openai_params)
+                    parsed_content = response.choices[0].message.parsed
+                    if parsed_content is None:
+                        raise ValueError("No parsed content in structured response")
+
+                    usage = response.usage
+                    finish_reason = response.choices[0].finish_reason
+
+                    if not isinstance(parsed_content, response_model):
+                        raise ValueError(
+                            f"Parsed content does not match the response model: {parsed_content} != {response_model}"
                         )
 
-                cache_creation, cache_read = extract_openai_cache_tokens(usage)
-                return HonchoLLMCallResponse(
-                    content=parsed_content,
-                    input_tokens=usage.prompt_tokens if usage else 0,
-                    output_tokens=usage.completion_tokens if usage else 0,
-                    cache_creation_input_tokens=cache_creation,
-                    cache_read_input_tokens=cache_read,
-                    finish_reasons=[finish_reason] if finish_reason else [],
-                    tool_calls_made=parsed_tool_calls,
-                    thinking_content=extract_openai_reasoning_content(response),
-                )
+                    parsed_tool_calls: list[dict[str, Any]] = []
+                    if (
+                        hasattr(response.choices[0].message, "tool_calls")
+                        and response.choices[0].message.tool_calls
+                    ):
+                        for tool_call in response.choices[0].message.tool_calls:
+                            parsed_tool_calls.append(
+                                {
+                                    "id": tool_call.id,
+                                    "name": tool_call.function.name,
+                                    "input": json.loads(tool_call.function.arguments)
+                                    if tool_call.function.arguments
+                                    else {},
+                                }
+                            )
+
+                    cache_creation, cache_read = extract_openai_cache_tokens(usage)
+                    return HonchoLLMCallResponse(
+                        content=parsed_content,
+                        input_tokens=usage.prompt_tokens if usage else 0,
+                        output_tokens=usage.completion_tokens if usage else 0,
+                        cache_creation_input_tokens=cache_creation,
+                        cache_read_input_tokens=cache_read,
+                        finish_reasons=[finish_reason] if finish_reason else [],
+                        tool_calls_made=parsed_tool_calls,
+                        thinking_content=extract_openai_reasoning_content(response),
+                    )
             else:
                 response: ChatCompletion = await client.chat.completions.create(  # pyright: ignore
                     **openai_params
