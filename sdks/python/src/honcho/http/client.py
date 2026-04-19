@@ -59,7 +59,6 @@ class HonchoHTTPClient:
         self._client = http_client or httpx.Client(  # nosec B113
             base_url=self.base_url,
             timeout=httpx.Timeout(timeout),
-            trust_env=False,
         )
 
     def close(self) -> None:
