@@ -303,6 +303,24 @@ class _EmbeddingClient:
                                 result[item.text_id][item.chunk_index] = (
                                     embedding.values
                                 )
+                elif self.provider == "ollama":
+                    base_url = (
+                        settings.LLM.EMBEDDING_BASE_URL or "http://localhost:11434"
+                    )
+                    dimensions = settings.VECTOR_STORE.DIMENSIONS
+                    async with httpx.AsyncClient() as client:
+                        response = await client.post(
+                            f"{base_url}/api/embed",
+                            json={
+                                "model": self.model,
+                                "input": [item.text for item in batch],
+                                "dimensions": dimensions,
+                            },
+                            timeout=60.0,
+                        )
+                        response.raise_for_status()
+                        for item, emb in zip(batch, response.json()["embeddings"]):
+                            result[item.text_id][item.chunk_index] = emb
                 else:  # openai / openrouter
                     response = await self.client.embeddings.create(
                         model=self.model, input=[item.text for item in batch]
