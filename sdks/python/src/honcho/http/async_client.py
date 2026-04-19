@@ -59,6 +59,7 @@ class AsyncHonchoHTTPClient:
         self._client = http_client or httpx.AsyncClient(  # nosec B113
             base_url=self.base_url,
             timeout=httpx.Timeout(timeout),
+            trust_env=False,
         )
 
     async def close(self) -> None:
